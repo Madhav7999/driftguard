@@ -1,171 +1,80 @@
-# pointintime
+# DriftGuard
 
-> A feature store where point-in-time correctness is enforced, proved by a planted leaking feature the store refuses to serve.
+![Python](https://img.shields.io/badge/Python_3.12-3776AB?logo=python&logoColor=white) ![MLflow](https://img.shields.io/badge/MLflow-0194E2?logo=mlflow&logoColor=white) ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white) ![scikit-learn](https://img.shields.io/badge/scikit--learn-F7931E?logo=scikitlearn&logoColor=white) ![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
 
-> **Implementation note.** The runnable core substitutes the spec's stack with standard-library equivalents: SQLite (bitemporal fact table, as-of reads via window functions) stands in for DuckDB; an in-process StreamingMaterialiser replaying the fact log under a watermark stands in for Kafka/Redpanda + Redis; a hand-written logistic regression and rank AUC stand in for sklearn; unittest replaces pytest. There is no FastAPI service or Docker setup. Code lives flat in src/ (store, registry, leakage, online, generator, experiment, model, demo) rather than the layout sketched below.
-
-FLAGSHIP - AI / ML Engineering - Expert - ~5-6 weeks - Fintech - credit decisioning
-
-**Primary language:** Python
-**Tags:** feature-store, point-in-time, data-leakage, streaming, kafka, sql
-
----
+> End-to-end ML lifecycle for demand forecasting: MLflow tracking and model registry, FastAPI serving, drift detection (PSI / KS), and an automated retrain-and-promote loop.
 
 ## The problem
 
-A credit model scores 0.91 AUC in training and 0.68 in production. The cause is almost always the same: a feature was computed using data that did not exist at decision time - an account balance as of today joined to a decision made eight months ago. The model learned the future. This costs real money and is nearly invisible in a standard train/test split.
+Models degrade silently after deployment. Most drift monitors only watch **input** distributions, so they miss the most expensive kind of drift: the relationship between inputs and outcomes changes while the inputs look the same. DriftGuard watches the model's **predictions against observed outcomes** and only retrains when the drift is statistically significant, leaving an auditable record of every decision.
 
-## The differentiator
+## Headline result
 
-Enforces **point-in-time-correct joins as the only way to retrieve training data**, and proves it with a **leakage test that deliberately constructs a future-leaking feature and asserts the store refuses to serve it**. It adds an automated **train/serve skew check** comparing offline and online values for the same entity and timestamp. A generic feature store provides a pleasant API for storing features and leaves point-in-time correctness as a convention the user must remember - which is to say, as a bug waiting for a deadline.
+Hourly bike-rental demand model (`HistGradientBoostingRegressor`), trained on 2011 and monitored through 2012:
 
-This is the sentence to lead with when someone asks you to walk through the project. Everything else in this repo exists to make it true and to prove it.
+| Stage | Model | Trained on | Held-out 2012 MAE |
+|---|---|---|---|
+| Initial | v1 | 2011 only | **87.31** |
+| After auto-retrain | v2 | 2011 + observed 2012 | **48.35** (-44.6%) |
 
-## Data
+Prediction drift (PSI) dropped from **0.223 to 0.067**, back below the 0.2 significance threshold. Input features barely moved (weather PSI ~0.04) while demand rose ~63%. A feature-only monitor would have missed this concept drift entirely.
 
-A documented synthetic generator producing entity event streams - transactions, applications, repayments - with a **planted leaking feature whose predictive power is entirely spurious**, giving the leakage test a definite pass/fail. Structure informed by the openly available Lending Club historical data.
+Both models are scored only on a held-out 20% slice of 2012 that neither was trained on, so the improvement is real generalization, not a train-on-test artifact. See [`docs/model_card.md`](docs/model_card.md).
 
-> No paid API key is required to run or demo this project. Where a paid service would add value it is wired as an optional enhancement behind an interface with an offline mock as the default implementation.
-
-## Stack
-
-- Python
-- DuckDB for the offline store; Redis for the online store
-- Kafka / Redpanda for streaming materialisation
-- SQL (as-of joins are the core artefact)
-- FastAPI, Docker, CI, pytest
-
-## Core capabilities
-
-- Feature definitions declaring entity, event timestamp, aggregation window and freshness SLA
-- Offline retrieval via as-of joins with a **mandatory** label-timestamp argument - there is no default
-- Streaming materialisation to the online store with watermark handling for late events
-- Train/serve skew detector comparing offline and online values on sampled entities
-- Feature lineage and a registry carrying ownership and deprecation state
-
-## Repository layout
+## How it works
 
 ```
-src/registry/
-src/offline/
-src/online/
-src/skew/
-generator/
-test/leakage/
+ reference period ──┐
+                    ├─> drift report (PSI / KS on features + predictions vs. outcomes)
+ monitored period ──┘            │
+                                 ▼
+                     significant drift? ── no ──> keep production model
+                                 │ yes
+                                 ▼
+             retrain on expanded data ─> register in MLflow ─> promote via "production" alias
+                                 │
+                                 ▼
+                re-measure drift, write before/after decision (artifacts/lifecycle.json)
 ```
 
-## Build plan
+- **Tracking & registry:** MLflow, with promotion through the modern alias API (`production`) instead of deprecated stages.
+- **Serving:** FastAPI app that loads whichever version holds the production alias.
+- **Decision record:** every run emits a `RetrainDecision` (drifted, retrained, old/new version, drift before/after) so each promotion can be audited.
 
-1. Generator with a planted leaking feature. Fit a model on the naive join and enjoy the 0.91 - it is the point.
-2. As-of join retrieval with a mandatory label timestamp. Making it mandatory is a design decision; defend it.
-3. Streaming materialisation with watermarks, then the skew detector.
-4. Freshness SLAs and the serving gate last.
+## Project structure
 
-## Testing strategy
+```
+src/driftguard/
+  monitor.py     # check_and_maybe_retrain: the drift -> retrain -> promote loop
+  schema.py      # feature definitions
+docs/
+  model_card.md  # generated model card with lifecycle numbers
+  REVIEW.md      # design review notes
+artifacts/
+  lifecycle.json # recorded before/after lifecycle metrics
+tests/           # CLI, model and serving tests
+Dockerfile, docker-compose.yml   # MLflow server + API
+```
 
-Assert the planted leaking feature produces high AUC under a naive join and is **rejected** by the store. Assert offline/online value parity within tolerance across 10,000 sampled entity-timestamps. Assert that late-arriving events **do not retroactively change already-served feature values** - the subtle streaming bug that reintroduces leakage through the back door.
-
-Tests assert **correctness**, not merely that the code runs. A green suite on this repo is a claim about behaviour under adversarial conditions; treat any test that would pass against a deliberately broken implementation as a bug in the test.
-
-## Quality & safety layer
-
-Freshness SLA violations block serving rather than silently returning stale features - a stale feature served as current is the online equivalent of leakage.
-
-## Measurable outcome
-
-> Design target: offline AUC matches production AUC - the 0.91 was leakage, and the store makes that class of error structurally impossible. Measured on the synthetic data (see below): the naive join reports 0.912 offline, the same model scores 0.654 on production inputs, and the point-in-time model scores 0.701 offline, the number production can actually expect.
-
-State it in these terms - business units, not technical ones - in your CV bullet and in the first thirty seconds of describing the project.
-
-## Measured results
-
-From python -m src.demo (seed 7, 400 synthetic applicants, 11,434 facts, 8,234 transactions of which 712 = 8.6% arrive late; chronological 60/40 split):
-
-| Model / path | Test AUC |
-|---|---|
-| Point-in-time features only | 0.701 |
-| Naive latest-value join (offline, leaks restated income) | **0.912** |
-| Same leaking model fed production (point-in-time) inputs | 0.654 |
-
-- The leak inflates offline AUC by +0.259 over what ships. Over 5 seeds (250 applicants each, run in the test suite) the offline-minus-deployed gap is 0.225 mean, SE 0.024. Deployed AUC is statistically indistinguishable from the honest model (0.715 vs 0.709): all the leak's power is spurious.
-- The registry refuses income_current_value (KNOWLEDGE_TIME_UNBOUNDED, RESTATED_ATTRIBUTE_WITHOUT_PIT_BOUND). The negative control income_at_application, which reads the same restatable column with a point-in-time bound, passes.
-- Train/serve skew over 10,000 sampled entity-timestamps x 4 features: knowledge-time watermark stream **0 / 40,000** mismatches (exact equality); event-time watermark stream (the back-door bug) **3,492 / 40,000 (8.73%)**, concentrated in income_at_application (1,570) and the 90-day transaction features (902 each).
-- Mutation check: forcing the store's as-of cutoff to "latest" (a naive latest-value join) fails 4/18 store tests, 4/12 streaming tests and 8/11 leak-measurement tests.
-- Suite: 59 tests, about 35-45 s; demo about 8 s.
-
-### Limitations
-
-- Synthetic data only; the planted restatement gap (11,000 USD, SD 3,000) is deliberately large, so the 0.91 inflation is a property of the generator, not an estimate for real lending data.
-- The detector is definitional: it is only as good as the attribute catalogue. An attribute not marked restatable gets only the generic rules.
-- SQLite + in-process replay, not DuckDB/Redis/Kafka: no concurrency, partitions, or real out-of-order network delivery; parity is exact because both paths share the same aggregation code.
-- Future-dated and knowledge-before-event rows are rejected or excluded at read/append time; the generator does not plant them in bulk (tests inject them directly).
-- No FastAPI service, lineage UI, or deprecation workflow beyond owner fields.
-
-## Interview questions this project answers
-
-- **What is a point-in-time correct join and why does it matter?**
-- **How do late-arriving events cause leakage?**
-- **What is train/serve skew and how would you detect it?**
-
-## What this deliberately is not
-
-- Not a Feast clone. It implements the one guarantee most feature stores leave to convention.
-- Not a model-training framework - it feeds one.
-
-## Run it now
+## Running the stack
 
 ```bash
-python -m unittest discover -s tests -v   # the suite
-python -m src.demo                        # the 60-second artefact
+docker compose up --build
+# MLflow UI:  http://localhost:5000
+# API:        http://localhost:8000/docs
 ```
 
-Requires Python 3.11+. The runnable core uses **only the standard library** (including sqlite3), so there is nothing to install.
-
-## Getting started
+Local development uses [uv](https://docs.astral.sh/uv/) with Python 3.12:
 
 ```bash
-git clone https://github.com/madhavmeesala/pointintime.git
-cd pointintime
-python -m unittest discover -s tests -v   # the suite
-python -m src.demo                        # the 60-second artefact
+uv sync
+uv run pytest -q
 ```
 
-Nothing to install - the runnable reference has no dependencies.
+## Tech stack
 
-<details>
-<summary>Target workflow for the full build (not yet implemented)</summary>
+Python 3.12 · pandas · scikit-learn · SciPy · MLflow · FastAPI · Pydantic · Docker Compose · pytest · ruff · mypy
 
-These commands describe the production stack this project grows into. None of them work in this repository today.
+## Author
 
-```bash
-# git clone https://github.com/madhavmeesala/pointintime.git
-# cd pointintime
-# docker compose up -d          # Redpanda + Redis
-# pip install -e .
-# python -m generator --entities 200000
-# pytest test/leakage           # naive join leaks; the store refuses
-# python -m src.skew check
-```
-
-</details>
-
-Docker is supported but optional - every path above works on a plain Windows/macOS/Linux laptop without a cloud account.
-
-## Definition of done
-
-- [ ] The differentiator above is implemented, and a test proves it
-- [ ] The measurable outcome is produced by a command anyone can run
-- [ ] README explains the one decision a generic version gets wrong
-- [ ] CI runs the full suite on every push and is green on main
-- [ ] A recruiter can see the headline artefact in under 60 seconds
-
-## Maintainer
-
-**Madhav Meesala**
-Software Engineer with 4+ years of experience specializing in scalable distributed systems, financial services, and MLOps.
-Email: madhavmeesala@gmail.com
-GitHub: github.com/madhavmeesala
-
-## Licence
-
-MIT - see [LICENSE](LICENSE).
+**Madhav Meesala**, Software Engineer · [Portfolio](https://madhavmeesala.com) · madhavmeesala@gmail.com
